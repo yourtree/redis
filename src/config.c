@@ -170,6 +170,11 @@ clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
 /* OOM Score defaults */
 int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT] = { 0, 200, 800 };
 
+/* Expand these two arrays to support more categories. */
+const int cate[] = {LC_COLLATE};
+const char *const catenames[] = {"collate"};
+const int catelen = 1;
+
 /* Generic config infrastructure function pointers
  * int is_valid_fn(val, err)
  *     Return 1 when val is valid, and 0 when invalid.
@@ -433,6 +438,41 @@ static int updateClientOutputBufferLimit(sds *args, int arg_len, const char **er
     }
 
     return 1;
+}
+
+char *getCategoryName(int cate) {
+    char *category;
+    switch (cate)
+    {
+        case LC_ALL: category = "all";break;
+        case LC_COLLATE: category = "collate";break;
+        case LC_CTYPE: category = "ctype";break;
+        case LC_MESSAGES: category = "messages";break;
+        case LC_MONETARY: category = "monetary";break;
+        case LC_NUMERIC: category = "numeric";break;
+        case LC_TIME: category = "time";break;
+        # ifdef LC_ADDRESS
+        case LC_ADDRESS: category = "address";break;
+        # endif 
+        # ifdef LC_IDENTIFICATION
+        case LC_IDENTIFICATION: category = "identification";break;
+        # endif
+        # ifdef LC_MEASUREMENT
+        case LC_MEASUREMENT: category = "measurement";break;
+        # endif
+        # ifdef LC_NAME
+        case LC_NAME: category = "name";break;
+        # endif
+        # ifdef LC_PAPER
+        case LC_PAPER: category = "paper";break;
+        # endif
+        # ifdef LC_TELEPHONE
+        case LC_TELEPHONE: category = "telephone";break;
+        # endif
+        default: category = NULL;break;
+    }
+    serverLog(LL_WARNING, "category is %s", category);
+    return category;
 }
 
 /* Note this is here to support detecting we're running a config set from
@@ -1427,7 +1467,7 @@ void rewriteConfigUserOption(struct rewriteConfigState *state) {
     /* Mark "user" as processed in case there are no defined users. */
     rewriteConfigMarkAsProcessed(state,"user");
 }
-
+  
 /* Rewrite the dir option, always using absolute paths.*/
 void rewriteConfigDirOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
     UNUSED(config);
@@ -1497,6 +1537,24 @@ void rewriteConfigClientOutputBufferLimitOption(standardConfig *config, const ch
                 (long) server.client_obuf_limits[j].soft_limit_seconds);
         rewriteConfigRewriteLine(state,name,line,force);
     }
+}
+
+void rewriteConfigLocaleOption(standardConfig *config, const char *name, struct rewriteConfigState *state) {
+    UNUSED(config);
+    int j, force = 1;
+    sds line;
+
+    line = sdsnew(name);
+    line = sdscatlen(line, " ", 1);
+    for (j = 0; j < catelen; j++) {
+        int _cate = cate[j];
+        char *category = getCategoryName(_cate);
+        line = sdscatprintf(line, "%s %s", category, server.locales[_cate]);
+        if (j != catelen - 1) {
+            line = sdscatlen(line, " ", 1);
+        }
+    }
+    rewriteConfigRewriteLine(state,name,line,force);
 }
 
 /* Rewrite the oom-score-adj-values option. */
@@ -2401,16 +2459,6 @@ static int isValidProcTitleTemplate(char *val, const char **err) {
     return 1;
 }
 
-
-static int updateLocale(const char **err) {
-    const char *s = setlocale(LC_COLLATE, server.locale);
-    if (s == NULL) {
-        *err = "Invalid locale name";
-        return 0;
-    }
-    return 1;
-}
-
 static int updateProcTitleTemplate(const char **err) {
     if (redisSetProcTitle(NULL) == C_ERR) {
         *err = "failed to set process title";
@@ -2695,6 +2743,76 @@ static sds getConfigSaveOption(standardConfig *config) {
 
     return buf;
 }
+
+static int setConfigLocaleOption(standardConfig *config, sds *argv, int argc, const char **err) {
+    UNUSED(config);
+
+    bool catecnt[LOCALE_CATEGORY_COUNT] = {0};
+    int i, j;
+    /* Since we can't be sure of the validity of the locale parameter unless 
+     * we call setlocale(), we need to roll back if anything goes wrong. */
+    char *rollback[LOCALE_CATEGORY_COUNT];
+    memcpy(rollback, server.locales, sizeof(server.locales));
+    
+
+    if (argc & 1 || (argc > (LOCALE_CATEGORY_COUNT << 1))) {
+        *err = "Wrong number of locale config.";
+        return 0;
+    }
+    
+    for (i = 0; i < argc; i += 2) {
+        int pos = -1;
+        char *_locale = argv[i + 1];
+        for (j = 0; j < catelen; j++) {
+            if (!strcmp(catenames[j], argv[i])) {
+                pos = j;
+                break;
+            }
+        }
+        /* Better check LC_ALL here to avoid duplicate set behavior
+         * if it is supported in the future. */
+        if (pos == -1 || catecnt[pos]) {
+            *err = "Invalid or duplicate category.";
+            goto revert;
+        }
+        catecnt[pos] = 1;
+        int _cate = cate[pos];
+        if (setlocale(_cate, _locale) == NULL) {
+            *err = "Invalid locale parameter.";
+            goto revert;
+        }
+        // zfree(server.locales[_cate]);
+        // server.locales[_cate] = (char*)zmalloc(strlen(_locale) + 1 * sizeof(char));
+        // memcpy(server.locales[_cate], _locale, strlen(_locale));
+        server.locales[_cate] = _locale;
+        // server.locales[_cate] = (char *) zmalloc(sizeof(_cate) * strlen(_locale));
+        // memcpy(server.locales[_cate], _locale, strlen(_locale));
+    }
+    return 1;   
+revert:
+    for (j = 0; j < catelen; j++) {
+        int _cate = cate[j];
+        setlocale(_cate, rollback[_cate]);
+        server.locales[_cate] = rollback[_cate];
+    }
+    return 0;
+}
+
+static sds getConfigLocaleOption(standardConfig *config) {
+    UNUSED(config);
+    sds buf = sdsempty();
+    int j;
+    for (j = 0; j < catelen; j++) {
+        int _cate = cate[j];
+        char *category = getCategoryName(_cate);
+        buf = sdscatprintf(buf, "%s %s", category, server.locales[_cate]);
+        if (j != catelen - 1) {
+            buf = sdscatlen(buf," ",1);
+        }
+    }
+    return buf;
+}
+
 
 static int setConfigClientOutputBufferLimitOption(standardConfig *config, sds *argv, int argc, const char **err) {
     UNUSED(config);
@@ -3006,7 +3124,6 @@ standardConfig static_configs[] = {
     createStringConfig("proc-title-template", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.proc_title_template, CONFIG_DEFAULT_PROC_TITLE_TEMPLATE, isValidProcTitleTemplate, updateProcTitleTemplate),
     createStringConfig("bind-source-addr", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.bind_source_addr, NULL, NULL, NULL),
     createStringConfig("logfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.logfile, "", NULL, NULL),
-    createStringConfig("locale", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.locale, "", NULL, updateLocale),
 
     /* SDS Configs */
     createSDSConfig("masterauth", NULL, MODIFIABLE_CONFIG | SENSITIVE_CONFIG, EMPTY_STRING_IS_NULL, server.masterauth, NULL, NULL, NULL),
@@ -3142,6 +3259,7 @@ standardConfig static_configs[] = {
     createSpecialConfig("bind", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigBindOption, getConfigBindOption, rewriteConfigBindOption, applyBind),
     createSpecialConfig("replicaof", "slaveof", IMMUTABLE_CONFIG | MULTI_ARG_CONFIG, setConfigReplicaOfOption, getConfigReplicaOfOption, rewriteConfigReplicaOfOption, NULL),
     createSpecialConfig("latency-tracking-info-percentiles", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigLatencyTrackingInfoPercentilesOutputOption, getConfigLatencyTrackingInfoPercentilesOutputOption, rewriteConfigLatencyTrackingInfoPercentilesOutputOption, NULL),
+    createSpecialConfig("locale", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigLocaleOption, getConfigLocaleOption, rewriteConfigLocaleOption, NULL),
 
     /* NULL Terminator, this is dropped when we convert to the runtime array. */
     {NULL}

@@ -396,6 +396,9 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
                                     buffer configuration. Just the first
                                     three: normal, slave, pubsub. */
 
+/* Total number of locale categories. */
+#define LOCALE_CATEGORY_COUNT 13
+
 /* Slave replication state. Used in server.repl_state for slaves to remember
  * what to do next. */
 typedef enum {
@@ -1649,10 +1652,12 @@ struct redisServer {
     int set_proc_title;             /* True if change proc title */
     char *proc_title_template;      /* Process title template format */
     clientBufferLimitsConfig client_obuf_limits[CLIENT_TYPE_OBUF_COUNT];
+    char *locales[LOCALE_CATEGORY_COUNT];
     int pause_cron;                 /* Don't run cron tasks (debug) */
     int latency_tracking_enabled;   /* 1 if extended latency tracking is enabled, 0 otherwise. */
     double *latency_tracking_info_percentiles; /* Extended latency tracking info output percentile list configuration. */
     int latency_tracking_info_percentiles_len;
+
     /* AOF persistence */
     int aof_enabled;                /* AOF configuration */
     int aof_state;                  /* AOF_(ON|OFF|WAIT_REWRITE) */
@@ -1942,8 +1947,6 @@ struct redisServer {
                                                 is down, doesn't affect pubsub global. */
     long reply_buffer_peak_reset_time; /* The amount of time (in milliseconds) to wait between reply buffer peak resets */
     int reply_buffer_resizing_enabled; /* Is reply buffer resizing enabled (1 by default) */
-    /* Local environment*/
-    char *locale;
 };
 
 #define MAX_KEYS_BUFFER 256

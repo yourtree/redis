@@ -56,9 +56,9 @@
 #include <limits.h>
 #include <float.h>
 #include <math.h>
+#include <locale.h>
 #include <sys/resource.h>
 #include <sys/utsname.h>
-#include <locale.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
 
@@ -1899,6 +1899,12 @@ void initServerConfig(void) {
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.page_size = sysconf(_SC_PAGESIZE);
     server.pause_cron = 0;
+    /* Initialize locales, now we only support LC_COLLATE. Expand
+     * to support more categories. */
+    // server.locales[LC_COLLATE] = zmalloc(sizeof(char));
+    // server.locales[LC_COLLATE] = "";
+    memset(server.locales, 0, sizeof(server.locales));
+    server.locales[LC_COLLATE] = "";
 
     server.latency_tracking_info_percentiles_len = 3;
     server.latency_tracking_info_percentiles = zmalloc(sizeof(double)*(server.latency_tracking_info_percentiles_len));
@@ -2439,13 +2445,6 @@ void initServer(void) {
     server.cluster_drop_packet_filter = -1;
     server.reply_buffer_peak_reset_time = REPLY_BUFFER_DEFAULT_PEAK_RESET_TIME;
     server.reply_buffer_resizing_enabled = 1;
-
-    /* Make sure the locale is set on startup based on the config file.*/
-    if (setlocale(LC_COLLATE,server.locale) == NULL) {
-        serverLog(LL_WARNING, "Failed to configure LOCALE. Applying default empty string.");
-        server.locale = "";
-        setlocale(LC_COLLATE, server.locale);
-    }
     
     resetReplicationBuffer();
     
