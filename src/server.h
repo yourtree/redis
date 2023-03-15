@@ -391,6 +391,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define CLIENT_ALLOW_OOM (1ULL<<44) /* Client used by RM_Call is allowed to fully execute
                                        scripts even when in OOM */
 #define CLIENT_NO_TOUCH (1ULL<<45) /* This client will not touch LFU/LRU stats. */
+#define CLIENT_PUSHING (1ULL<<46) /* This client is pushing notifications. */
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
@@ -398,6 +399,7 @@ typedef enum blocking_type {
     BLOCKED_NONE,    /* Not blocked, no CLIENT_BLOCKED flag set. */
     BLOCKED_LIST,    /* BLPOP & co. */
     BLOCKED_WAIT,    /* WAIT for synchronous replication. */
+    BLOCKED_WAITAOF, /* WAITAOF for AOF file fsync. */
     BLOCKED_MODULE,  /* Blocked by a loadable module. */
     BLOCKED_STREAM,  /* XREAD. */
     BLOCKED_ZSET,    /* BZPOP et al. */
@@ -920,7 +922,7 @@ typedef struct clientReplyBlock {
  *      |                                            /       \
  *      |                                           /         \
  *      |                                          /           \
- *  Repl Backlog                               Replia_A      Replia_B
+ *  Repl Backlog                               Replica_A    Replica_B
  * 
  * Each replica or replication backlog increments only the refcount of the
  * 'ref_repl_buf_node' which it points to. So when replica walks to the next
@@ -1009,6 +1011,7 @@ typedef struct blockingState {
 
     /* BLOCKED_WAIT */
     int numreplicas;        /* Number of replicas we are waiting for ACK. */
+    int numlocal;           /* Indication if WAITAOF is waiting for local fsync. */
     long long reploffset;   /* Replication offset to reach. */
 
     /* BLOCKED_MODULE */
@@ -1101,6 +1104,31 @@ typedef struct {
     size_t mem_usage_sum;
 } clientMemUsageBucket;
 
+#ifdef LOG_REQ_RES
+/* Structure used to log client's requests and their
+ * responses (see logreqres.c) */
+typedef struct {
+    /* General */
+    int argv_logged; /* 1 if the command was logged */
+    /* Vars for log buffer */
+    unsigned char *buf; /* Buffer holding the data (request and response) */
+    size_t used;
+    size_t capacity;
+    /* Vars for offsets within the client's reply */
+    struct {
+        /* General */
+        int saved; /* 1 if we already saved the offset (first time we call addReply*) */
+        /* Offset within the static reply buffer */
+        int bufpos;
+        /* Offset within the reply block list */
+        struct {
+            int index;
+            size_t used;
+        } last_node;
+    } offset;
+} clientReqResInfo;
+#endif
+
 typedef struct client {
     uint64_t id;            /* Client incremental unique ID. */
     uint64_t flags;         /* Client flags: CLIENT_* macros. */
@@ -1149,6 +1177,7 @@ typedef struct client {
     long long reploff;      /* Applied replication offset if this is a master. */
     long long repl_applied; /* Applied replication data count in querybuf, if this is a replica. */
     long long repl_ack_off; /* Replication ack offset, if this is a slave. */
+    long long repl_aof_off; /* Replication AOF fsync ack offset, if this is a slave. */
     long long repl_ack_time;/* Replication ack time, if this is a slave. */
     long long repl_last_partial_write; /* The last time the server did a partial write from the RDB child pipe to this replica  */
     long long psync_initial_offset; /* FULLRESYNC reply offset other slaves
@@ -1212,6 +1241,9 @@ typedef struct client {
     int bufpos;
     size_t buf_usable_size; /* Usable size of buffer. */
     char *buf;
+#ifdef LOG_REQ_RES
+    clientReqResInfo reqres;
+#endif
 } client;
 
 /* ACL information */
@@ -1540,6 +1572,11 @@ struct redisServer {
     client *current_client;     /* The client that triggered the command execution (External or AOF). */
     client *executing_client;   /* The client executing the current command (possibly script or module). */
 
+#ifdef LOG_REQ_RES
+    char *req_res_logfile; /* Path of log file for logging all requests and their replies. If NULL, no logging will be performed */
+    unsigned int client_default_resp;
+#endif
+
     /* Stuff for client mem eviction */
     clientMemUsageBucket* client_mem_usage_buckets;
 
@@ -1768,6 +1805,11 @@ struct redisServer {
     char replid2[CONFIG_RUN_ID_SIZE+1]; /* replid inherited from master*/
     long long master_repl_offset;   /* My current replication offset */
     long long second_replid_offset; /* Accept offsets up to this for replid2. */
+    redisAtomic long long fsynced_reploff_pending;/* Largest replication offset to
+                                     * potentially have been fsynced, applied to
+                                       fsynced_reploff only when AOF state is AOF_ON
+                                       (not during the initial rewrite) */
+    long long fsynced_reploff;      /* Largest replication offset that has been confirmed to be fsynced */
     int slaveseldb;                 /* Last SELECTed DB in replication output */
     int repl_ping_slave_period;     /* Master pings the slave every N seconds */
     replBacklog *repl_backlog;      /* Replication backlog for partial syncs */
@@ -1825,7 +1867,7 @@ struct redisServer {
     long long master_initial_offset;           /* Master PSYNC offset. */
     int repl_slave_lazy_flush;          /* Lazy FLUSHALL before loading DB? */
     /* Synchronous replication. */
-    list *clients_waiting_acks;         /* Clients waiting in WAIT command. */
+    list *clients_waiting_acks;         /* Clients waiting in WAIT or WAITAOF. */
     int get_ack_from_slaves;            /* If true we send REPLCONF GETACK. */
     /* Limits */
     unsigned int maxclients;            /* Max number of simultaneous clients */
@@ -2106,30 +2148,38 @@ typedef struct redisCommandArg {
     int num_args;
 } redisCommandArg;
 
-/* Must be synced with RESP2_TYPE_STR and generate-command-code.py */
-typedef enum {
-    RESP2_SIMPLE_STRING,
-    RESP2_ERROR,
-    RESP2_INTEGER,
-    RESP2_BULK_STRING,
-    RESP2_NULL_BULK_STRING,
-    RESP2_ARRAY,
-    RESP2_NULL_ARRAY,
-} redisCommandRESP2Type;
+#ifdef LOG_REQ_RES
 
-/* Must be synced with RESP3_TYPE_STR and generate-command-code.py */
+/* Must be synced with generate-command-code.py */
 typedef enum {
-    RESP3_SIMPLE_STRING,
-    RESP3_ERROR,
-    RESP3_INTEGER,
-    RESP3_DOUBLE,
-    RESP3_BULK_STRING,
-    RESP3_ARRAY,
-    RESP3_MAP,
-    RESP3_SET,
-    RESP3_BOOL,
-    RESP3_NULL,
-} redisCommandRESP3Type;
+    JSON_TYPE_STRING,
+    JSON_TYPE_INTEGER,
+    JSON_TYPE_BOOLEAN,
+    JSON_TYPE_OBJECT,
+    JSON_TYPE_ARRAY,
+} jsonType;
+
+typedef struct jsonObjectElement {
+    jsonType type;
+    const char *key;
+    union {
+        const char *string;
+        long long integer;
+        int boolean;
+        struct jsonObject *object;
+        struct {
+            struct jsonObject **objects;
+            int length;
+        } array;
+    } value;
+} jsonObjectElement;
+
+typedef struct jsonObject {
+    struct jsonObjectElement *elements;
+    int length;
+} jsonObject;
+
+#endif
 
 /* WARNING! This struct must match RedisModuleCommandHistoryEntry */
 typedef struct {
@@ -2280,6 +2330,10 @@ struct redisCommand {
     struct redisCommand *subcommands;
     /* Array of arguments (may be NULL) */
     struct redisCommandArg *args;
+#ifdef LOG_REQ_RES
+    /* Reply schema */
+    struct jsonObject *reply_schema;
+#endif
 
     /* Runtime populated data */
     long long microseconds, calls, rejected_calls, failed_calls;
@@ -2587,6 +2641,12 @@ client *lookupClientByID(uint64_t id);
 int authRequired(client *c);
 void putClientInPendingWriteQueue(client *c);
 
+/* logreqres.c - logging of requests and responses */
+void reqresReset(client *c, int free_buf);
+void reqresSaveClientReplyOffset(client *c);
+size_t reqresAppendRequest(client *c);
+size_t reqresAppendResponse(client *c);
+
 #ifdef __GNUC__
 void addReplyErrorFormatEx(client *c, int flags, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
@@ -2737,6 +2797,7 @@ int checkGoodReplicasStatus(void);
 void processClientsWaitingReplicas(void);
 void unblockClientWaitingReplicas(client *c);
 int replicationCountAcksByOffset(long long offset);
+int replicationCountAOFAcksByOffset(long long offset);
 void replicationSendNewlineToMaster(void);
 long long replicationGetSlaveOffset(void);
 char *replicationGetSlaveName(client *c);
@@ -3300,6 +3361,7 @@ void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeo
 void blockClientShutdown(client *c);
 void blockPostponeClient(client *c);
 void blockForReplication(client *c, mstime_t timeout, long long offset, long numreplicas);
+void blockForAofFsync(client *c, mstime_t timeout, long long offset, int numlocal, long numreplicas);
 void signalDeletedKeyAsReady(redisDb *db, robj *key, int type);
 void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int had_errors);
 void scanDatabaseForDeletedKeys(redisDb *emptied, redisDb *replaced_with);
@@ -3564,6 +3626,7 @@ void bitcountCommand(client *c);
 void bitposCommand(client *c);
 void replconfCommand(client *c);
 void waitCommand(client *c);
+void waitaofCommand(client *c);
 void georadiusbymemberCommand(client *c);
 void georadiusbymemberroCommand(client *c);
 void georadiusCommand(client *c);
